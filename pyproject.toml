@@ -1,0 +1,19 @@
+[build-system]
+requires=["setuptools>=68","wheel"]
+build-backend="setuptools.build_meta"
+
+[project]
+name="aegisrover"
+version="1.0.0"
+description="Autonomous mobile robot simulation, navigation and telemetry platform"
+requires-python=">=3.11"
+dependencies=["numpy>=1.24","fastapi>=0.110","pydantic>=2","uvicorn>=0.30"]
+
+[project.optional-dependencies]
+test=["pytest>=8","httpx>=0.27"]
+
+[project.scripts]
+aegisrover="aegisrover.service.cli:main"
+
+[tool.setuptools.packages.find]
+where=["src"]
