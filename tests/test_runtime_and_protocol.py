@@ -7,7 +7,7 @@ from aegisrover.protocol.transport import (
     FrameError, Reassembler, SequenceTracker, authenticate, decode_frame, encode_frame, verify_frame,
 )
 from aegisrover.protocol.auth import ReplayWindow
-from aegisrover.runtime.backpressure import AdmissionController
+from aegisrover.runtime.backpressure import AdaptiveConfig, AdmissionController
 from aegisrover.runtime.clock import MonotonicOrder, estimate as estimate_clock
 from aegisrover.runtime.negotiation import (
     NegotiationError, Offer, Requirement, negotiate,
@@ -139,6 +139,104 @@ def test_backpressure_rejects_insufficient_priority_for_shedding():
     assert controller.enqueue('a', now=0, priority=5, quota='fast').allowed
     denied = controller.enqueue('b', now=0, priority=1, quota='fast')
     assert not denied.allowed and denied.reason == 'queue_full'
+
+
+def test_backpressure_adaptive_rate_probes_upward_when_calm():
+    controller = AdmissionController(
+        adaptive=AdaptiveConfig(window=1.0, increase=2.0, decrease=0.5))
+    controller.add_quota('g', rate=4, burst=4, min_rate=1, max_rate=8)
+    for t in (1.0, 2.0, 3.0, 4.0):
+        controller.update(now=t)  # calm windows add capacity: 4 -> 6 -> 8 -> 8
+    assert controller.quota('g').bucket.rate == pytest.approx(8.0)  # clamped at max_rate
+
+
+def test_backpressure_adaptive_rejection_without_backlog_is_not_overload():
+    controller = AdmissionController(
+        adaptive=AdaptiveConfig(window=1.0, increase=2.0, decrease=0.5))
+    controller.add_quota('g', rate=4, burst=4, min_rate=1, max_rate=8)
+    for i in range(4):
+        assert controller.admit(f'a{i}', now=0, quota='g').allowed
+    assert not controller.admit('b', now=0, quota='g').allowed  # demand exceeds the rate...
+    report = controller.update(now=1.0)
+    # ...but nothing is queued, so the limiter probes upward instead of cutting
+    assert report['rates']['g'] == pytest.approx(6.0)
+
+
+def test_backpressure_adaptive_rate_has_floor():
+    controller = AdmissionController(
+        queue_limit=8,
+        adaptive=AdaptiveConfig(window=1.0, decrease=0.5, queue_target=0.25))
+    controller.add_quota('g', rate=8, burst=8, min_rate=1, max_rate=8)
+    for i in range(4):  # queue stays above target (2) the whole time
+        assert controller.enqueue(f'q{i}', now=0, quota='g').allowed
+    for t in (1.0, 2.0, 3.0, 4.0):
+        controller.update(now=t)  # 8 -> 4 -> 2 -> 1 -> 1
+    assert controller.quota('g').bucket.rate == pytest.approx(1.0)  # min_rate floor
+
+
+def test_backpressure_adaptive_tightens_on_queue_buildup():
+    controller = AdmissionController(
+        queue_limit=4,
+        adaptive=AdaptiveConfig(window=1.0, increase=1.0, decrease=0.5, queue_target=0.5))
+    controller.add_quota('g', rate=100, burst=100, min_rate=1, max_rate=100)
+    for i in range(3):  # depth 3 > target 2, without a single rejection
+        assert controller.enqueue(f'q{i}', now=0, quota='g').allowed
+    report = controller.update(now=1.0)
+    assert report['rates']['g'] == pytest.approx(50.0)
+
+
+def test_backpressure_adaptive_tightens_on_queue_full_rejections():
+    controller = AdmissionController(
+        queue_limit=2,
+        adaptive=AdaptiveConfig(window=1.0, decrease=0.5, queue_target=1.0))
+    controller.add_quota('g', rate=100, burst=100, min_rate=1, max_rate=100)
+    for i in range(2):
+        assert controller.enqueue(f'q{i}', now=0, quota='g').allowed
+    assert not controller.enqueue('q2', now=0, quota='g').allowed  # queue_full rejection
+    report = controller.update(now=1.0)  # depth at target, yet a rejection still cuts the rate
+    assert report['rates']['g'] == pytest.approx(50.0)
+
+
+def test_backpressure_sustained_overload_sheds_backlog():
+    controller = AdmissionController(
+        queue_limit=8,
+        adaptive=AdaptiveConfig(window=1.0, queue_target=0.25,
+                                overload_interval=5.0, shed_interval=1.0))
+    controller.add_quota('g', rate=100, burst=100)  # static quota, adaptive shedding only
+    for i in range(6):
+        assert controller.enqueue(f'q{i}', now=0, priority=i, quota='g').allowed
+    controller.update(now=1.0)  # overload already detected once depth crossed the target
+    assert controller.shed == 0
+    controller.update(now=4.0)  # still within overload_interval: nothing shed yet
+    assert controller.shed == 0
+    report = controller.update(now=6.0)  # sustained overload -> shedding begins
+    assert report['shed'] == ['q0', 'q1']  # lowest priority first, cadence 1/sqrt(n) escalates
+    report = controller.update(now=7.0)
+    assert report['shed'] == ['q2']
+    report = controller.update(now=8.0)
+    assert report['shed'] == ['q3']
+    assert controller.snapshot(now=8.0)['queue_depth'] == 2  # back at target, shedding pauses
+    controller.pop_ready(now=8.0, limit=2)
+    report = controller.update(now=9.0)
+    assert not report['overloaded']  # queue drained below target: overload state cleared
+
+
+def test_backpressure_without_adaptive_config_never_sheds():
+    controller = AdmissionController(queue_limit=2, policy='reject')
+    controller.add_quota('g', rate=100, burst=100)
+    for i in range(2):
+        assert controller.enqueue(f'q{i}', now=0, quota='g').allowed
+    report = controller.update(now=100.0)
+    assert report['shed'] == []
+    assert controller.snapshot(now=100.0)['queue_depth'] == 2
+
+
+def test_backpressure_adaptive_bounds_require_config():
+    with pytest.raises(ValueError):
+        AdmissionController().add_quota('g', rate=1, burst=1, min_rate=0.5, max_rate=2)
+    controller = AdmissionController(adaptive=AdaptiveConfig())
+    with pytest.raises(ValueError):
+        controller.add_quota('g', rate=1, burst=1, min_rate=0.5)  # bounds must come in pairs
 
 
 # ------------------------------------------------------------------------------ clock
