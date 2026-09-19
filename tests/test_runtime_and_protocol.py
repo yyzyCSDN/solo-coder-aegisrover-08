@@ -7,7 +7,7 @@ from aegisrover.protocol.transport import (
     FrameError, Reassembler, SequenceTracker, authenticate, decode_frame, encode_frame, verify_frame,
 )
 from aegisrover.protocol.auth import ReplayWindow
-from aegisrover.runtime.backpressure import AdmissionController
+from aegisrover.runtime.backpressure import AdmissionController, AdaptivePolicy
 from aegisrover.runtime.clock import MonotonicOrder, estimate as estimate_clock
 from aegisrover.runtime.negotiation import (
     NegotiationError, Offer, Requirement, negotiate,
@@ -139,6 +139,77 @@ def test_backpressure_rejects_insufficient_priority_for_shedding():
     assert controller.enqueue('a', now=0, priority=5, quota='fast').allowed
     denied = controller.enqueue('b', now=0, priority=1, quota='fast')
     assert not denied.allowed and denied.reason == 'queue_full'
+
+
+def test_backpressure_adaptive_rate_decreases_on_rejection():
+    controller = AdmissionController(window=1.0)
+    controller.add_quota('global', rate=4, burst=4)
+    controller.enable_adaptive('global', AdaptivePolicy(
+        min_rate=1.0, max_rate=50.0, increase_step=2.0, decrease_factor=0.5, min_samples=4))
+    for key in ('a', 'b', 'c', 'd'):
+        assert controller.admit(key, now=0).allowed
+    assert not controller.admit('e', now=0).allowed
+    assert not controller.admit('f', now=0).allowed
+    controller.admit('g', now=1.0)  # closes the window before evaluating 'g'
+    assert controller.quota('global').bucket.rate == pytest.approx(2.0)
+    controller.admit('h', now=1.0)
+    assert not controller.admit('i', now=1.0).allowed
+    assert not controller.admit('j', now=1.0).allowed
+    controller.admit('k', now=2.0)
+    assert controller.quota('global').bucket.rate == pytest.approx(1.0)
+    for key in ('l', 'm', 'n'):
+        assert not controller.admit(key, now=2.0).allowed
+    controller.admit('o', now=3.0)  # rate is clamped at min_rate, not below
+    assert controller.quota('global').bucket.rate == pytest.approx(1.0)
+
+
+def test_backpressure_adaptive_rate_increases_only_when_saturated():
+    controller = AdmissionController(window=1.0)
+    controller.add_quota('global', rate=4, burst=4)
+    controller.enable_adaptive('global', AdaptivePolicy(
+        min_rate=1.0, max_rate=6.0, increase_step=3.0, decrease_factor=0.5, min_samples=2))
+    for key in ('a', 'b', 'c', 'd'):
+        assert controller.admit(key, now=0).allowed
+    controller.admit('e', now=1.0)  # saturated and clean: probe up, clamped by max_rate
+    assert controller.quota('global').bucket.rate == pytest.approx(6.0)
+    controller.admit('f', now=1.5)
+    controller.admit('g', now=1.5)
+    controller.tune(now=2.5)  # demand below capacity: hold, no drift upward
+    assert controller.quota('global').bucket.rate == pytest.approx(6.0)
+
+
+def test_backpressure_sustained_overload_sheds_backlog_then_recovers():
+    controller = AdmissionController(queue_limit=8, policy='reject', window=1.0,
+                                     relief_after=2, queue_floor=2)
+    controller.add_quota('fast', rate=1000, burst=1000)
+    for i in range(8):
+        assert controller.enqueue(f'p{i}', now=0, priority=i, quota='fast').allowed
+    assert controller.snapshot(now=0)['queue_depth'] == 8
+    assert not controller.enqueue('x1', now=0.5, quota='fast').allowed
+    controller.tune(now=1.0)  # overloaded window 1
+    assert controller.relief == 0
+    assert not controller.enqueue('x2', now=1.5, quota='fast').allowed
+    controller.tune(now=2.0)  # overloaded window 2 -> relief 1, limit halved to 4
+    assert controller.relief == 1
+    assert controller.effective_queue_limit == 4
+    assert controller.snapshot(now=2.0)['queue_depth'] == 4
+    assert controller.shed == 4
+    assert not controller.enqueue('x3', now=2.5, quota='fast').allowed
+    controller.tune(now=3.0)
+    assert not controller.enqueue('x4', now=3.5, quota='fast').allowed
+    controller.tune(now=4.0)  # relief 2 -> limit 2, only the top priorities survive
+    assert controller.relief == 2
+    assert controller.effective_queue_limit == 2
+    assert controller.shed == 6
+    assert controller.pop_ready(now=4.5, limit=8) == ['p7', 'p6']
+    controller.tune(now=5.0)  # calm windows de-escalate one level at a time
+    assert controller.relief == 2
+    controller.tune(now=6.0)
+    assert controller.relief == 1
+    controller.tune(now=7.0)
+    assert controller.relief == 1
+    controller.tune(now=8.0)
+    assert controller.relief == 0
 
 
 # ------------------------------------------------------------------------------ clock
